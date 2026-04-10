@@ -1,3 +1,4 @@
+import argparse
 import math
 import random
 import time
@@ -8,6 +9,8 @@ import pybullet_data
 
 from panda_robot import PandaRobot
 from helper_functions import animate_path, execute_rrt_star, get_arm_joint_limits, sample_feasible_goals, merge_paths, set_arm_configuration, configuration_feasible, benchmark_control_modes
+from helper_functions import fk_ee_position
+import env
 
 INCLUDE_GRIPPER = True
 SAMPLING_RATE = 1e-3 # 1000 Hz
@@ -18,8 +21,6 @@ GOAL_BIAS = 0.15 # goal bias
 GOAL_REACH_EPS = 0.2  # rad (L2) to treat goal as reached
 EDGE_DISCRETIZATION_STEPS = 24 # number of discretization steps per edge
 NEAR_RADIUS_SCALE = 1.8 # near radius scale
-
-
 
 def create_goal_ball(radius=0.1, rgba=(1, 0, 0, 0.8), position=[0.5, 0, 0.8], orientation=[0, 0, 0, 1]):
     """Create a visual goal ball"""
@@ -37,15 +38,62 @@ def create_goal_ball(radius=0.1, rgba=(1, 0, 0, 0.8), position=[0.5, 0, 0.8], or
     )
     return ball_id
 
-def fk_ee_position(panda_robot, q_arm_7):
-    set_arm_configuration(panda_robot, q_arm_7)  # from helper_functions
-    ee_link = panda_robot.dof  # matches IK in PandaRobot
-    pos = p.getLinkState(panda_robot.robot_id, ee_link)[4]
-    return pos
+def load_obstacles():
+    obstacle_ids = []
+    # Setup box obstacles
+    boxes, obstacles = env.boxes, env.obstacles
+    for box in boxes:
+        box_half_extents = box["half_extents"]
+        box_center = box["position"]
+        box_id = p.createCollisionShape(p.GEOM_BOX, halfExtents=box_half_extents)
+        obstacle_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=box_id, basePosition=box_center)
+        obstacle_ids.append(obstacle_id)
+    # Setup other obstacles, e.g. r2d2
+    for obstacle in obstacles:
+        obstacle_id = p.loadURDF(
+            obstacle["name"] + ".urdf",
+            basePosition=obstacle["position"],
+            useFixedBase=True,
+        )
+        obstacle_ids.append(obstacle_id)    
+
+    return obstacle_ids
 
 # ----------------------------------------------------------------------------------------------------------------------
 def main():
     """Main function to run the RRT* algorithm and animate the path."""
+    parser = argparse.ArgumentParser(description="RRT* baseline: Franka Panda in PyBullet.")
+    parser.add_argument(
+        "--no-random-goals",
+        action="store_false",
+        dest="random_goals",
+        default=True,
+        help="Use a fixed IK goal ball instead of randomly sampled feasible goals.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["position", "torque_pd", "computed_torque"],
+        default="position",
+        help="Control mode to use for the robot."
+    )
+    parser.add_argument(
+        "--algo",
+        choices=["rrt_star"],
+        default="rrt_star",
+        help="Algorithm to use for the robot."
+    )
+    parser.add_argument(
+        "--stats_csv_path",
+        default="rrt_star_stats.csv",
+        help="Path to save the statistics of the algorithm."
+    )
+
+    args = parser.parse_args()
+    random_goals = args.random_goals
+    mode = args.mode
+    algo = args.algo
+    stats_csv_path = args.stats_csv_path
+
     # Set random seed for reproducibility
     random.seed(0)
     np.random.seed(0)
@@ -59,19 +107,8 @@ def main():
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.loadURDF("plane.urdf")
 
-    # Setup box obstacle
-    box_half_extents = [0.12, 0.25, 0.18]  # x, y, z half extents
-    box_center = [0.45, 0.0, 0.35] # [0.45, 0.0, 0.35]  # x, y, z center
-    box_id = p.createCollisionShape(p.GEOM_BOX, halfExtents=box_half_extents)
-    obstacle_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=box_id, basePosition=box_center)
-
-    # R2D2 as a second static obstacle (URDF from pybullet_data)
-    r2d2_id = p.loadURDF(
-        "r2d2.urdf",
-        basePosition=[0.55, 0.45, 0.0],
-        useFixedBase=True,
-    )
-    obstacle_ids = [obstacle_id, r2d2_id]
+    # Load obstacles
+    obstacle_ids = load_obstacles()
 
     # Setup Panda robot
     panda_robot = PandaRobot(include_gripper=INCLUDE_GRIPPER)
@@ -89,37 +126,43 @@ def main():
         panda_robot.set_target_positions(q_start)
 
     # Sample feasible goals
-    random_goals = True 
     if random_goals:
         goals = sample_feasible_goals(panda_robot, lowers, uppers, obstacle_ids, NUM_GOALS)
         marker_ids = []
         colors = [[1, 0, 0, 0.9], [0, 1, 0, 0.9], [0, 0, 1, 0.9], [1, 1, 0, 0.9], [1, 0, 1, 0.9]]
 
         for i, q_g in enumerate(goals):
-            ee_pos = fk_ee_position(panda_robot, q_g)
-            mid = create_goal_ball(radius=0.04, rgba=colors[i % len(colors)], position=ee_pos)
+            state = fk_ee_position(panda_robot, q_g)
+            mid = create_goal_ball(radius=0.04, rgba=colors[i % len(colors)], position=state[4], orientation=state[5])
             marker_ids.append(mid)
+        
+        if len(goals) < NUM_GOALS:
+            print(
+                "Could only sample {} feasible goals (collision-free). "
+                "Try moving the obstacles or increasing max tries.".format(len(goals))
+            )
+
     else: # use ball as goal
-        goal_position = [-0.9, 0, 0.7]
-        goal_orient = p.getQuaternionFromEuler([0.0, 0.0, 0.0])# [0, 0, 0, 1]
-        goal_ball_id = create_goal_ball(position=goal_position)
-        #goal_orient = p.getQuaternionFromEuler([math.pi, 0.0, 0.0]) # if in RPY
-        ik = panda_robot.calculate_inverse_kinematics(goal_position, goal_orient)
-        goals = [list(ik[:7])]  # first 7 are arm joints
-        if goals[0] is None:
-            print("Could not calculate inverse kinematics for goal ball; disconnecting.")
-            p.disconnect()
-            return
+        goals = []
+        for goal in env.goals:
+            goal_position = goal["position"]
+            goal_orient = goal["orientation"]
+            goal_ball_id = create_goal_ball(position=goal_position)
+            ik = panda_robot.calculate_inverse_kinematics(goal_position, goal_orient)
+            goals.append(list(ik[:7]))  # first 7 are arm joints
+            if goals[0] is None:
+                print("Could not calculate inverse kinematics for goal ball; disconnecting.")
+                p.disconnect()
+                return
 
-    print ("Goals: ", goals)
-    if len(goals) < NUM_GOALS:
-        print(
-            "Could only sample {} feasible goals (collision-free). "
-            "Try moving the obstacles or increasing max tries.".format(len(goals))
-        )
-
-    # RRT* execution
-    full_segments = execute_rrt_star(panda_robot, q_start, goals, lowers, uppers, obstacle_ids)
+    # RRT* execution or other algorithms
+    if algo == "rrt_star":
+        full_segments = execute_rrt_star(panda_robot, q_start, goals, 
+            lowers, uppers, obstacle_ids, stats_csv_path=stats_csv_path)
+    else:
+        print("Algorithm not supported.")
+        p.disconnect()
+        return
 
     if not full_segments:
         print("No feasible path; disconnecting.")
@@ -132,16 +175,18 @@ def main():
     panda_robot.set_target_positions(path[0]) #set the start configuration for the robot
     for _ in range(20): #wait for 20 steps to stabilize the robot
         p.stepSimulation()
+
     animate_path(
         panda_robot,
         path,
         hold_steps_per_vertex=200,
-        control_mode="position",
+        control_mode=mode,
         kp=200.0,
         kd=30.0,
         max_torque=87.0,
         print_tracking_error=True,
-    ) #animate the path with a single selected controller
+    ) 
+    #animate the path with a single selected controller
     # benchmark_control_modes(
     #     panda_robot,
     #     path,

@@ -1,0 +1,6 @@
+segment_index,success,iterations,accepted_expansions,num_tree_nodes,cumulative_path_cost
+0,1,68,51,53,4.33534891
+1,0,120,47,48,
+2,1,117,71,73,6.91299880
+3,1,105,74,76,6.80550643
+4,1,58,33,35,3.32737446

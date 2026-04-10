@@ -2,6 +2,7 @@
 Helper functions for the Franka Emika Panda 7-DOF robot.
 """
 
+import csv
 import math
 import random
 import time
@@ -49,6 +50,12 @@ def configuration_feasible(panda_robot, q_arm, obstacle_ids):
                 return False
     return True
 
+def fk_ee_position(panda_robot, q_arm_7):
+    """Get the end effector position and orientation given the arm joint angles"""
+    set_arm_configuration(panda_robot, q_arm_7) 
+    ee_link = panda_robot.dof  # matches IK in PandaRobot
+    state = p.getLinkState(panda_robot.robot_id, ee_link)
+    return state
 
 def distance_q(a, b):
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
@@ -67,19 +74,51 @@ def sample_feasible_goals(panda_robot, lowers, uppers, obstacle_ids, count, max_
 
 # ========== RRT* FUNCTIONS ==========
 
-def execute_rrt_star(panda_robot, q_start, goals, lowers, uppers, obstacle_ids):
-    """Execute the RRT* algorithm."""
-    # Plan a path for each goal with RRT*
+def execute_rrt_star(panda_robot, q_start, goals, lowers, uppers, obstacle_ids, stats_csv_path=None):
+    """
+    Execute the RRT* algorithm.
+
+    If ``stats_csv_path`` is set, append one CSV row per planning attempt with columns:
+    ``segment_index``, ``success``, ``iterations``, ``accepted_expansions``,
+    ``num_tree_nodes``, ``cumulative_path_cost`` (joint-space path length; empty if failed).
+    """
     full_segments = []
+    csv_rows = []
     q_from = q_start
     for gi, q_g in enumerate(goals):
         print("Planning RRT* segment {} -> goal {} ...".format(gi, gi + 1))
-        path_seg = rrt_star_segment(panda_robot, q_from, q_g, lowers, uppers, obstacle_ids)
+        seg_stats = {} if stats_csv_path is not None else None
+        path_seg = rrt_star_segment(
+            panda_robot, q_from, q_g, lowers, uppers, obstacle_ids, stats_out=seg_stats
+        )
+        if stats_csv_path is not None:
+            csv_rows.append({"segment_index": gi, **seg_stats})
         if path_seg is None:
             print("  Segment failed; skipping this goal.")
             continue
         full_segments.append(path_seg)
         q_from = q_g #update the start configuration for the next goal
+
+    if stats_csv_path is not None and csv_rows:
+        fieldnames = [
+            "segment_index",
+            "success",
+            "iterations",
+            "accepted_expansions",
+            "num_tree_nodes",
+            "cumulative_path_cost",
+        ]
+        with open(stats_csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in csv_rows:
+                out = dict(row)
+                if out.get("cumulative_path_cost") is None:
+                    out["cumulative_path_cost"] = ""
+                else:
+                    out["cumulative_path_cost"] = "{:.8f}".format(out["cumulative_path_cost"])
+                out["success"] = "1" if out.get("success") else "0"
+                writer.writerow(out)
 
     return full_segments
 
@@ -116,17 +155,36 @@ def near_indices(nodes, q_new, radius):
     return [i for i, n in enumerate(nodes) if distance_q(n["q"], q_new) < radius]
 
 
-def rrt_star_segment(panda_robot, q_start, q_goal, lowers, uppers, obstacle_ids):
+def _fill_rrt_segment_stats(stats_out, success, iterations, nodes, goal_idx, accepted_expansions):
+    """Populate ``stats_out`` in place (caller passes a dict)."""
+    cost = nodes[goal_idx]["cost"] if success and goal_idx is not None else None
+    stats_out["success"] = bool(success)
+    stats_out["iterations"] = int(iterations)
+    stats_out["accepted_expansions"] = int(accepted_expansions)
+    stats_out["num_tree_nodes"] = int(len(nodes))
+    stats_out["cumulative_path_cost"] = float(cost) if cost is not None else None
+
+
+def rrt_star_segment(
+    panda_robot, q_start, q_goal, lowers, uppers, obstacle_ids, stats_out=None
+):
     """
     Plan from q_start to (near) q_goal. Returns list of configurations from start
     to goal along the tree, or None.
+
+    If ``stats_out`` is a dict, it is filled with:
+    ``success``, ``iterations`` (main loop count), ``accepted_expansions`` (new tree
+    vertices added in the loop), ``num_tree_nodes`` (total nodes including start and
+    goal if any), ``cumulative_path_cost`` (sum of Euclidean joint-space edge lengths
+    along the returned path, or None if planning failed).
     """
     def sample_uniform():
         return [random.uniform(lo, hi) for lo, hi in zip(lowers, uppers)]
 
     nodes = [{"q": list(q_start), "parent": None, "cost": 0.0}]
+    accepted_expansions = 0
 
-    for _ in range(MAX_ITER_PER_SEGMENT):
+    for iteration in range(1, MAX_ITER_PER_SEGMENT + 1):
         # Sample a random goal with a bias towards the goal
         if random.random() < GOAL_BIAS:
             q_rand = list(q_goal)
@@ -168,6 +226,7 @@ def rrt_star_segment(panda_robot, q_start, q_goal, lowers, uppers, obstacle_ids)
         new_node = {"q": q_new, "parent": best_parent, "cost": best_cost}
         new_idx = len(nodes)
         nodes.append(new_node)
+        accepted_expansions += 1
 
         # Iterate through the near indices and update the parent and cost (re-wiring)
         for i in near_is:
@@ -189,6 +248,10 @@ def rrt_star_segment(panda_robot, q_start, q_goal, lowers, uppers, obstacle_ids)
                         "cost": best_cost + distance_q(q_new, q_goal),
                     }
                 )
+                if stats_out is not None:
+                    _fill_rrt_segment_stats(
+                        stats_out, True, iteration, nodes, goal_idx, accepted_expansions
+                    )
                 return extract_path(nodes, goal_idx)
 
     i_best = nearest_index(nodes, q_goal) #nearest node index to the goal
@@ -202,7 +265,20 @@ def rrt_star_segment(panda_robot, q_start, q_goal, lowers, uppers, obstacle_ids)
                     "cost": nodes[i_best]["cost"] + distance_q(nodes[i_best]["q"], q_goal),
                 }
             )
+            if stats_out is not None:
+                _fill_rrt_segment_stats(
+                    stats_out,
+                    True,
+                    MAX_ITER_PER_SEGMENT,
+                    nodes,
+                    goal_idx,
+                    accepted_expansions,
+                )
             return extract_path(nodes, goal_idx)
+    if stats_out is not None:
+        _fill_rrt_segment_stats(
+            stats_out, False, MAX_ITER_PER_SEGMENT, nodes, None, accepted_expansions
+        )
     return None
 
 
@@ -233,7 +309,6 @@ def merge_paths(segments):
             out.extend(seg) #if not, add the entire segment to the path
     return out
 
-
 def animate_path(
     panda_robot,
     path,
@@ -256,6 +331,7 @@ def animate_path(
     use_gravity_compensation is kept for backward compatibility:
       True -> "torque_pd", False -> "position"
     """
+    print("Animating path with control mode: ", control_mode)
     if use_gravity_compensation is not None:
         control_mode = "torque_pd" if use_gravity_compensation else "position"
     if control_mode not in ("position", "torque_pd", "computed_torque"):
