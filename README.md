@@ -12,6 +12,12 @@
 
 --------------------------------------------------------------------------------
 
+Set up (tested on python 3.8 on ubuntu 20.04 and python 3.10 on ubuntu 22.04):
+
+       python3 -m venv .venv
+       pip3 install -r requirements.txt
+
+
 Simple simulation environment for the Franka Emika Panda 7-DOF robot. The project also includes the recording of a 55 seconds movement of the Franka Emika Panda with a mounted gripper that aimed to provide a well explored state space dataset as it also recorded the torque values applied by the robots control loop after having been corrected by its internal PID controller. The dataset can be found in 'movement_datasets/fep_state_to_pid-corrected-torque_55s_dataset.csv' and is recorded in radian at a sampling rate of 1000Hz, resulting in 55,000 data points. The dataset is visualized in the plots below.
 
 Aside from the functionality to visualize a recorded FEP dataset does the project also provide the code to create simulated torque values based on PyBullet's internal inverse dynamics calculation via the Recursive Newton-Euler Algorithm (RNEA) as well as the option to perform gravity compensation in the simulation. PyBullets RNEA algorithm is calculated based on the FEP robot model description that was taken from Franka Emikas official ROS repository (see [here](https://github.com/frankaemika/franka_ros)) and was converted from .xacro to .urdf via ROS. In simulation is it possible to consider the dynamic effects of an end effector (a gripper in this project), though only the torques for the 7 joints of the body are recorded.
